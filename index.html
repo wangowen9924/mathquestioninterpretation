@@ -138,6 +138,10 @@ header.app{position:relative}
 .foot{margin-top:24px;text-align:right;font:13px var(--zh);color:#9AA6A2}
 
 .original{margin-top:18px}
+.modelnote{margin:10px 2px 0;font:13px var(--en);color:var(--soft)}
+.tech{margin-top:10px;font-size:13px}
+.tech summary{cursor:pointer;color:#7A2415}
+.tech pre{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #EFC3BA;border-radius:8px;padding:8px;margin:6px 0 0;font:12px/1.45 ui-monospace,Menlo,monospace;color:#3B1A12;user-select:text;-webkit-user-select:text}
 .original summary{cursor:pointer;color:var(--soft);font-size:16px}
 .original img{max-width:100%;border-radius:10px;margin-top:10px;border:1px solid var(--line)}
 
@@ -151,7 +155,7 @@ header.app{position:relative}
 @media print{
   body{background:#fff}
   .wrap{max-width:none;padding:0}
-  header.app,#setupPanel,.toolbar,.tip,.original,#pickPanel,#statusPanel,.err{display:none!important}
+  header.app,#setupPanel,.toolbar,.tip,.modelnote,.original,#pickPanel,#statusPanel,.err{display:none!important}
   .sheet{background-image:none;box-shadow:none;padding:0}
   [contenteditable]{outline:none}
 }
@@ -215,6 +219,7 @@ header.app{position:relative}
     <div class="tip" id="tip" hidden><h3>给奶奶的讲解提示</h3><p id="tipText"></p></div>
     <p class="hint" style="margin:0 0 10px">发现翻译有误？直接点文字就可以修改。<span class="en">Tap any text to fix it.</span></p>
     <div class="sheet-scroll"><article class="sheet" id="sheet"></article></div>
+    <p class="modelnote" id="modelNote"></p>
     <details class="original"><summary>查看原图 See original photo</summary><div id="origImgs"></div></details>
   </section>
 </div>
@@ -365,6 +370,7 @@ Use [] for choices/directions when there are none. If the worksheet has no title
     network:'连不上服务器。请检查网络后再试。'+EN('Network error.'),
     image_rejected:'照片太大或无法识别，请重新拍一张。'+EN('Photo rejected.'),
     refused:'没能处理这张照片，请换一张再试。'+EN('Photo could not be processed.'),
+    invalid_json:'模型的回答无法读取，请再试一次。'+EN('Model answer could not be read. Try again.'),
     too_long:'这份作业太长了，请分开拍、每次少传几页。'+EN('Too much at once. Send fewer pages.'),
   };
   const errMsg = e => {
@@ -397,27 +403,35 @@ Use [] for choices/directions when there are none. If the worksheet has no title
         headers:{'content-type':'application/json','x-goog-api-key':getKey()},
         body:JSON.stringify({contents:[{role:'user',parts}],
           generationConfig:{responseMimeType:'application/json',maxOutputTokens:32768}})});
-    }catch(e){ if(e&&e.name==='AbortError') throw {code:'cancelled'}; throw {code:'network'}; }
+    }catch(e){ if(e&&e.name==='AbortError') throw {code:'cancelled'}; throw {code:'network',detail:'fetch failed (network/CORS)'}; }
     let body=null; try{body=await r.json()}catch(e){}
     if(!r.ok){
       const msg=(body&&body.error&&body.error.message)||'', st=(body&&body.error&&body.error.status)||'';
-      if(/API key not valid|API_KEY_INVALID/i.test(msg)||r.status===401) throw {code:'bad_key'};
-      if(/location is not supported/i.test(msg)) throw {code:'region'};
-      if(r.status===404) throw {code:'try_next'};
-      if(r.status===429) throw {code:/limit:\s*0\b/.test(msg)?'try_next':'rate_limited'};
-      if(r.status===503||r.status===500) throw {code:'try_next',last:'overloaded'};
-      if(r.status===403) throw {code:'forbidden',msg};
-      if(r.status===413) throw {code:'image_rejected'};
-      throw {code:'api',msg:msg||st};
+      const detail=`HTTP ${r.status}${st?' '+st:''}${msg?': '+msg.slice(0,160):''}`;
+      if(/API key not valid|API_KEY_INVALID/i.test(msg)||r.status===401) throw {code:'bad_key',detail};
+      if(/location is not supported/i.test(msg)) throw {code:'region',detail};
+      if(r.status===404) throw {code:'try_next',detail};
+      if(r.status===429) throw {code:/limit:\s*0\b/.test(msg)?'try_next':'rate_limited',detail};
+      if(r.status===503||r.status===500) throw {code:'try_next',busy:true,last:'overloaded',detail};
+      if(r.status===403) throw {code:'forbidden',detail};
+      if(r.status===413) throw {code:'image_rejected',detail};
+      throw {code:'api',msg:msg||st,detail};
     }
-    if(body&&body.promptFeedback&&body.promptFeedback.blockReason) throw {code:'refused'};
+    if(body&&body.promptFeedback&&body.promptFeedback.blockReason) throw {code:'refused',detail:'HTTP 200, blocked: '+body.promptFeedback.blockReason};
+    lastVersion=(body&&body.modelVersion)||'';
     const cand=(body&&body.candidates||[])[0]||{};
-    if(cand.finishReason==='MAX_TOKENS') throw {code:'too_long'};
+    const fr=cand.finishReason||'?';
+    if(fr==='MAX_TOKENS') throw {code:'too_long',detail:'HTTP 200, finishReason MAX_TOKENS'};
     const text=((cand.content&&cand.content.parts)||[]).filter(p=>p.text&&!p.thought).map(p=>p.text).join('');
-    if(!text) throw {code:cand.finishReason==='SAFETY'?'refused':'invalid_json'};
-    return parseJson(text);
+    if(!text) throw fr==='SAFETY'?{code:'refused',detail:'HTTP 200, finishReason SAFETY'}:{code:'try_next',last:'invalid_json',detail:`HTTP 200, empty answer (finishReason ${fr})`};
+    try{ return parseJson(text); }
+    catch(e){ throw {code:'try_next',last:'invalid_json',detail:`HTTP 200, answer was not valid JSON (${text.length} chars, finishReason ${fr})`}; }
   }
 
+  const wait=(ms,signal)=>new Promise((res,rej)=>{const t=setTimeout(res,ms);
+    signal&&signal.addEventListener('abort',()=>{clearTimeout(t);rej({code:'cancelled'})},{once:true});});
+
+  let lastModel='', lastVersion='';
   async function callGemini(signal){
     const parts=[];
     for(let i=0;i<pages.length;i++){
@@ -426,13 +440,25 @@ Use [] for choices/directions when there are none. If the worksheet has no title
     }
     parts.push({text:PROMPT});
     const saved=store.get(LS_MODEL);
-    const order=saved?[saved,...MODELS.filter(m=>m!==saved)]:MODELS;
-    let lastErr={code:'no_model'};
+    const order=saved&&MODELS.includes(saved)?[saved,...MODELS.filter(m=>m!==saved)]:MODELS;
+    const attempts=[]; let lastErr={code:'no_model'};
     for(const m of order){
-      try{ const out=await callOnce(m,parts,signal); store.set(LS_MODEL,m); return out; }
-      catch(e){ if(e.code!=='try_next') throw e; lastErr=e.last?{code:e.last}:{code:'no_model'}; }
+      for(let tryNo=1;tryNo<=2;tryNo++){          // a busy (503) model gets one retry after a pause
+        const t0=Date.now();
+        try{
+          const out=await callOnce(m,parts,signal);
+          store.set(LS_MODEL,m); lastModel=m; return out;
+        }catch(e){
+          if(e.code==='cancelled') throw e;
+          attempts.push(`${m} (try ${tryNo}, ${((Date.now()-t0)/1000).toFixed(1)}s): ${e.detail||e.code}`);
+          if(e.code!=='try_next'){ e.attempts=attempts; throw e; }
+          lastErr={code:e.last||'no_model'};
+          if(e.busy&&tryNo===1){ await wait(4000,signal); continue; }
+          break;
+        }
+      }
     }
-    throw lastErr;
+    lastErr.attempts=attempts; throw lastErr;
   }
 
   async function run(){
@@ -452,10 +478,14 @@ Use [] for choices/directions when there are none. If the worksheet has no title
         return;
       }
       lastData=data; renderSheet(data);
+      $('#modelNote').textContent='使用模型 Model: '+lastModel+(lastVersion&&lastVersion!==lastModel?` (${lastVersion})`:'');
       statusPanel.hidden=true; resultPanel.hidden=false; window.scrollTo({top:0});
     }catch(e){
       pickPanel.hidden=false;
-      if(!e || e.code!=='cancelled') showErr(errMsg(e));
+      if(!e || e.code!=='cancelled'){
+        const log=(e&&e.attempts&&e.attempts.length)?e.attempts:[(e&&e.detail)||(e&&e.code)||'unknown error'];
+        showErr(errMsg(e)+`<details class="tech"><summary>技术详情 Details</summary><pre>${esc(log.join('\n'))}\n${esc(new Date().toLocaleString())}</pre></details>`);
+      }
     }finally{
       clearInterval(timer); statusPanel.hidden=true; ctl=null;
     }
